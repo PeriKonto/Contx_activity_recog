@@ -1,0 +1,760 @@
+---
+title: "Activity recognition using sensors"
+author: "Peri Kontoroupis"
+date: "2024-03-22"
+output: html_document
+warnings: FALSE
+---
+
+```{r library setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# its not wise to use the following librariy
+library(dplyr)
+library(zoo)
+library(xts)
+library(tidyr)
+library(ggplot2)
+library(fuzzyjoin)
+library(lubridate)
+library(data.table)
+library(tibble)
+library(tidymodels)
+library(pROC)
+library(stats)
+library(FNN)
+library(tidyverse)
+library(scutr)
+library(rpart)
+library(rpart.plot)
+options(warn=-1)
+```
+
+## Overview of the approach
+
+This document presents an overview of the methodology used to detect activties using supervised machine learning approaches. I explored the use of decision trees, random forest, bagged trees and Xgboosting algorithms. These approaches were implemented on sensor data from one day of activity after linking the activity-log (seen in export_7-12-2022_detailed.csv) to the sensor data from the Pocketlab_demonstrator.csv completed in 2022. The later contains position data (x,y,z) from multiple days and for various sensors, including the diamond drill, the jack hammer, the milling drill, the dust extractor and the underarm. 
+
+The activities I tried to detect included, Onder schouderhoogte, Boven schouderhoogte, Schouderhoogte from the underarm sensor. Data from the  2022-12-07, were selected in the analysis.
+
+The two databases were linked using their time-stamps via a fuzzy join at one-second interval. Sensor readings were smoothed using different moving windows from 5 to 30 seconds. Accordingly, these smoothed sensor readings were annotated one of the three activities. 
+
+Balancing the three groups was also investigated.  Class imbalancing was identified on the time-window selected. In machine learning, class imbalance occurs when the number of instances of one class (the majority class) significantly outweighs the number of instances of another class (the minority class). This can lead to biased models that perform poorly at predicting the minority class. It is noted that it was usual that one occupational activity was less frequent than others.
+
+This was solved using a Synthetic Minority Over-sampling Technique: I up-sampled the minority classes while avoiding overfitting until I balanced them. This is accomplished by generating new synthetic data close to the data (belonging to the minority class) in the feature space. I used a  a Synthetic Minority Over-sampling Technique (SMOTE). SMOTE works by generating synthetic examples in the feature space of the minority class by interpolating between existing instances. 
+
+
+In addition, after implementing the aforementioned ML approaches, a temporal data leakage was identified. This involved future information inadvertently used to predict the past outcomes which lead to overly optimistic performance estimates!!  
+I addressed this issue by splitting the data in a time-ordered manner: data were divided into $consecutive$ training and test sets. Furthermore, the training set was allowed to grow over time, including data up to a certain point, and the test set consisted of data following a specific point in time!.  This process was repeated for several splits, each time moving the cut-off point further along the time series. It is believed that this approach respects the temporal order of the observations.  
+Performance of the ML methods were computed, after calculating a confusion matrix, and included the sensitivity, the specificity, the accuracy and the ROC.  
+
+Tuning of the hyper-parameters was completed by searching the possible parameter combination (grid search) for each fold and evaluating with regard to the best ROC or accuracy value but this can be easily adjusted. The final parameter was selected and included in the final model for prediction using the validation data.
+
+###Future steps
+[1] The labelled activity is at 1sec, which clearly is unrealistic. I have the code ready and was experimenting with different time windows (5sec - 30sec activity). I haven't decided the grouping I am going to use (I will look at their distribution) but this needs to be generalized.  
+
+[2] I will use a conda environment to set the environement for R and each library I used. For now I suppressed the warnings. Also the coding is simple but not efficient. I will use recipes to make things better and parallelize processes to find the best tuned hyperparameters.
+
+[3] I plan to use un-supervised machine learning approaches (no budget left), to see if I can predict the same classes at specific time points and migrate all this code to a more specialized library to test many additional routines (I could test additional ML and ANN approaches that I believe improve the generality of these methods), without adding any additional specialized libraries
+
+[4] I plan to use a Topological Synthetic Minority Over-sampling Technique (T-SMOTE). T-SMOTE, incorporates topological information into the SMOTE algorithm to create synthetic samples that are more representative of the minority class.
+
+[5] Improve tuned models to a different days and combine different sensors together in the prediction estimates.
+
+[6] I plan to use Kalman filters to the sensor data since I believe this would provide a more reliable estimate of the x,y,z position estimates
+
+[7] I didnt have time to implement a nested cross-validation, using methods of Inner Grid Search and Inner Bayesian Optimization
+
+[8] I plan to improve the Xgboosting algorithm: tune the hyperparameters using Bayesian Optimization using the following snipset
+
+[9] Add a routine to plot one vs rest ROC curve (evaluate multiclass models by comparing each class against all the others at the same time) using the yardstick library
+
+```{r load data}
+set.seed(1234)
+file_path <- "C:/.../export_7-12-2022_detailed.csv"
+activity <- read.csv(file_path, sep = ";" , header= TRUE)
+activitydf <- separate(activity, timeline.start.date.end.date.duration..minutes..name.notes,
+                       into = c("activity_name", "start_date", "end_date", "duration_minutes", "name", "notes"),
+                       sep = ",")
+activitydf$duration_minutes <- as.numeric(trimws(activitydf$duration_minutes))
+
+
+start_time <- as.POSIXct("2022-12-07 07:00:00", TZ="CET")
+end_time <- as.POSIXct("2022-12-07 13:30:00", TZ="CET")
+activitydf1 <- activitydf %>%
+  filter(start_date >= start_time & start_date <= end_time) %>%
+ filter(activity_name %in% c("Onder schouderhoogte", "Boven schouderhoogte ", "Schouderhoogte"))
+
+
+
+# Summarize by activity_name and list how many times it occurred
+activities <- activitydf %>%
+  group_by(activity_name) %>%
+  summarize(total_duration_minutes = sum(duration_minutes),
+            occurrences = n(), minimum = min(duration_minutes), 
+            maximum = max(duration_minutes)) %>%
+  arrange(desc(occurrences))
+
+print(activities)
+
+file_path <- "C:/.../Pocketlab_demonstrator_2022.csv"
+Sensors <- read.csv(file_path, header = TRUE, sep = ",", comment.char = "")
+Sensors$datetime <- as.POSIXct(Sensors$datetime, format = "%Y-%m-%d %H:%M:%S", TZ="CET")
+
+start_time <- as.POSIXct("2022-12-07 07:00:00", TZ="CET")
+end_time <- as.POSIXct("2022-12-07 13:30:00", TZ="CET")
+Sensors_subset <- Sensors %>%
+  filter(datetime >= start_time & datetime <= end_time)
+
+Sensors_subset1 <- Sensors_subset %>%
+  mutate(Sensors = case_when(
+    SensorID == "C6:FC:C8:6F:CD:88" ~ "Underarm", #underarm/PL1    
+    SensorID == "EF:69:F8:82:CF:6F" ~ "Diamond drill", #tool 2/PL2-
+    SensorID == "DC:C4:90:CB:C5:04" ~ "Dust extractor",  #tool 3/PL3
+    SensorID == "F5:95:BA:A9:38:42" ~ "Milling drill",  #tool 7/PL7-
+    SensorID == "E8:3B:EA:22:97:23" ~ "jack hammer",  #tool 8/PL8-
+    SensorID == "C7:01:3B:18:FE:C4" ~ "Tool4notused",  #tool 4/PL4
+    SensorID == "F5:EE:8A:C3:B9:1A" ~ "Tool5notused",  #tool 5/PL5
+    SensorID == "FA:3A:B9:03:2B:9A" ~ "Tool6notused"  #tool 6/PL5
+  )) %>%
+  group_by(Measurement, SensorID) %>%
+  filter( Sensors != "Tool4notused" & Sensors != "Tool5notused"& Sensors != "Tool6notused") 
+
+subset_df1 <- activitydf1[activitydf1$start_date >= as.POSIXct("2022-12-07 07:00:00") & 
+                          activitydf1$end_date <= as.POSIXct("2022-12-07 13:30:00"), ]
+
+activitydf1$start_date <- as.POSIXct(activitydf1$start_date, format = "%Y-%m-%d %H:%M:%S", tz="CET")
+activitydf1$end_date <- as.POSIXct(activitydf1$end_date, format = "%Y-%m-%d %H:%M:%S", tz="CET")
+
+
+```
+
+## Visualization of activites per sensor reading (x,y,z) and sensor type 
+
+To better visualize I specify a specific time window:
+
+```{r pressure, echo=FALSE}
+    color_palette <- c("#FFCC80", "#B39DDB", "#81D4FA") 
+ggplot() +
+  geom_line(data = Sensors_subset1, aes(x = datetime, y = Value, color = Measurement)) +
+  geom_rect(data = activitydf1, aes(xmin = start_date, xmax = end_date, 
+                                   ymin = -Inf, ymax = Inf, 
+                                   fill = activity_name), alpha = 0.3) +
+  facet_wrap(.~Sensors, nrow = 3) +    
+  geom_hline(yintercept = 0.0075, lty = 2) +
+    scale_fill_manual(values = color_palette) + 
+  xlim(as.POSIXct("2022-12-07 11:40:00"), as.POSIXct("2022-12-07 12:10:00")) +
+  ggtitle("2022-12-07, Sensor raw data from all devices")
+
+
+
+```
+
+## Fuzzy join the two tables using their time stamps and sensor value smoothing
+
+
+```{r join the data}
+
+# Convert Sensors_subset1 datetime to character for fuzzy join
+  Sensors_subset1$datetime_char <- as.character(Sensors_subset1$datetime)
+  
+  # Fuzzy left join based on time range
+  ready_data <- fuzzy_left_join(Sensors_subset1, activitydf1, 
+                                by = c("datetime_char" = "start_date", "datetime_char" = "end_date"), 
+                                match_fun = list(`>=`, `<=`))
+  
+  # Remove the temporary datetime_char column
+  ready_data <- ready_data[, -which(names(ready_data) == "datetime_char")]
+  
+  columns_to_keep <- c("datetime", "Measurement", "Value", "Sensors", "activity_name", "start_date", "end_date")
+  
+  # Drop other columns
+  ready_data <- select(ready_data, all_of(columns_to_keep))
+  
+  
+  clean_data <- ready_data
+  clean_data$activity_name <- as.factor(clean_data$activity_name)
+  
+  subset_Underarm <- clean_data %>% 
+                   filter(SensorID == "C6:FC:C8:6F:CD:88") %>%
+    filter(start_date >= as.POSIXct("2022-12-07 07:00:00", TZ="CET") &
+           start_date <= as.POSIXct("2022-12-07 13:30:00", TZ="CET")) 
+
+  #  sensor value smoothing
+  #subset_Underarm2 <- subset_Underarm %>% 
+  #  mutate(new_datetime = datetime , 
+  #         rollm_30 = rollapply(Value,width=30,FUN=mean, partial=5,fill=NA),
+  #         rollsd_30 = rollapply(Value,width=30,FUN=sd, partial=5,fill=NA))
+
+  
+Smoothtime <-30 
+
+subset_Underarm2 <- subset_Underarm %>% 
+    mutate( new_startime = datetime,
+           new_endtime = datetime + seconds(Smoothtime),
+           new_activity = rollapply(as.character(activity_name), width = Smoothtime, FUN = function(x) {
+             if(length(x) > 0) {
+               mode_factor <- factor(x)
+               mode_factor[which.max(tabulate(mode_factor))]
+             } else {
+               NA
+             }
+           }, by = 1, partial = TRUE, fill = NA), 
+           rollm_30 = rollapply(Value,width=Smoothtime,FUN=mean, partial=5,fill=NA),
+           rollsd_30 = rollapply(Value,width=Smoothtime,FUN=sd, partial=5,fill=NA))
+
+  
+
+  ggplot() +
+  geom_rect(data = subset_Underarm2, aes(xmin = start_date, xmax = end_date, 
+                                         ymin = -Inf, ymax = Inf, 
+                                         fill = activity_name)) +  
+  geom_line(data = subset_Underarm2, aes(x = datetime, y = rollm_30, color = Measurement), size = 1.5) +  
+  geom_line(data = subset_Underarm2, aes(x = datetime, y = Value, color = Measurement)) +
+  geom_hline(yintercept = 0.0075, lty = 2) +
+  xlim(as.POSIXct("2022-12-07 11:40:00"), as.POSIXct("2022-12-07 12:10:00")) +
+  scale_fill_manual(values = color_palette) + 
+  ggtitle("2022-12-07, Smoothed sensor data for the underarm sensor")
+    
+
+  
+```
+
+# now its time to convert the data for some ML 
+
+```{r convert the data for ML usage }
+
+wide_result <- dcast(subset_Underarm2, datetime + Sensors + activity_name + start_date + end_date ~ Measurement, value.var = "rollm_30") # I need to re-name the rollm_30 value!!
+
+# Convert wide_result to data.table if needed
+wide_data <- as.data.table(wide_result)
+
+# Replace NAs in the newly created columns with 0
+wide_data[, c("x", "y", "z") := lapply(.SD, function(x) ifelse(is.na(x), 0, x)), .SDcols = c("x", "y", "z")] 
+
+
+# a qu
+ggplot(wide_data, aes(x = datetime)) + geom_rect(data = wide_data, aes(xmin = start_date, xmax = end_date, 
+                                  ymin = -Inf, ymax = Inf, 
+                                  fill = activity_name)) +  
+  scale_fill_manual(values = color_palette) + 
+  geom_line(aes(y = x, color = "x")) +
+  geom_line(aes(y = y, color = "y")) +
+  geom_line(aes(y = z, color = "z")) +
+  scale_color_manual(values = c("x" = "red", "y" = "green", "z" = "blue")) +
+  xlim(as.POSIXct("2022-12-07 11:40:00"), as.POSIXct("2022-12-07 12:10:00")) +
+  ggtitle("2022-12-07, Underarm data after convertion for ML") +
+  labs(x = "Datetime", y = "Value")
+
+# lets check if activity classes are unbalanced 
+labels <- table(wide_data$activity_name)
+class_proportions <- prop.table(labels) ### unbalanced
+print(class_proportions)
+minority_instances <- min(class_proportions)
+majority_instances <- max(table(wide_data$activity_name))
+
+
+
+#Smote the clusters one by one
+table(wide_data$activity_name)
+numeric_data <- wide_data[, c("datetime","x", "y", "z","activity_name","start_date", "end_date" )]
+numeric_data$datetime <- as.numeric(as.POSIXct(numeric_data$datetime))
+numeric_data$start_date <- as.numeric(as.POSIXct(numeric_data$start_date))
+numeric_data$end_date <- as.numeric(as.POSIXct(numeric_data$end_date))
+
+## this is the best way to use nested minority group oversampling for time series using T-SMOTE the Topological Synthetic Minority Over-sampling.
+# SMOTE works by generating synthetic examples in the feature space of the minority class by interpolating between existing instances. 
+# T-SMOTE, on the other hand, incorporates topological information into the SMOTE algorithm to create synthetic samples that are more representative of the minority class. 
+# this technique needs some extra coding from my side, but didn't have time to adjust it. I hope to get some extra hours to try it out! 
+
+smoted1 <- oversample_smote(numeric_data, "Schouderhoogte", "activity_name", majority_instances )
+smoted2 <- oversample_smote(numeric_data, "Boven schouderhoogte ", "activity_name", majority_instances )
+
+#Combine each clusters into new training set
+train_1 <- dplyr::filter(numeric_data, numeric_data$activity_name == 'Onder schouderhoogte')
+train_1 <- rbind(train_1, smoted1, smoted2)
+#Check the result
+table(train_1$activity_name) # they are now balanced but I need to
+
+train_1$datetime <- as.POSIXct(train_1$datetime, format = "%d/%m/%Y %H:%M:%S", tz="CET")
+train_1$start_date <- as.POSIXct(train_1$start_date, format = "%d/%m/%Y %H:%M:%S", tz="CET")
+train_1$end_date <- as.POSIXct(train_1$end_date, format = "%d/%m/%Y %H:%M:%S", tz="CET")
+
+ggplot(train_1, aes(x = datetime)) + geom_rect(data = wide_data, aes(xmin = start_date, xmax = end_date, 
+                                                                       ymin = -Inf, ymax = Inf, 
+                                                                       fill = activity_name)) +  
+  geom_line(aes(y = x, color = "x")) +
+  geom_line(aes(y = y, color = "y")) +
+  geom_line(aes(y = z, color = "z")) +
+  scale_color_manual(values = c("x" = "red", "y" = "green", "z" = "blue")) +
+  scale_fill_manual(values = color_palette) +  # Set custom color palette
+  xlim(as.POSIXct("2022-12-07 11:40:00"), as.POSIXct("2022-12-07 12:10:00")) +
+  ggtitle("2022-12-07, raw data Underarm after nested sampling T-SMOTE") +
+  labs(x = "Datetime", y = "Value")
+
+```
+
+
+```{r Prepare data to avoid tempoeral leakage }
+split_data <- initial_time_split(wide_data,prop = 0.6) # unfortunately the data are too few to test, so I had to take the unrealistic 60%, attention there is a high risk for temporal data leakage, use the routines below
+training_data <- training(split_data)
+folds <- vfold_cv(training_data, v = 20)
+testing_data <- testing(split_data)
+
+# but somehow the r-markdown returns an error and didn;t have the time to fix it
+
+#split_data <- initial_time_split(train_1,prop = 0.7)
+#training_data <- training(split_data)
+#folds <- vfold_cv(training_data, v = 10)
+#testing_data <- testing(split_data)
+
+library(tidyverse)
+library(rsample)
+
+folds <-  
+  sliding_period(
+    training_data,
+    datetime,
+    "minute",
+    lookback = 2,
+    assess_stop = 5
+  )
+
+folds <- vfold_cv(training_data, v = 10)
+
+
+# lets check the intervals I will do the ML fitting
+max(analysis(folds$splits[[1]])$date) - min(analysis(folds$splits[[1]])$date)
+max(analysis(folds$splits[[2]])$date) - min(analysis(folds$splits[[2]])$date)
+max(analysis(folds$splits[[3]])$date) - min(analysis(folds$splits[[3]])$date)
+max(analysis(folds$splits[[4]])$date) - min(analysis(folds$splits[[4]])$date)
+max(analysis(folds$splits[[5]])$date) - min(analysis(folds$splits[[5]])$date)
+
+
+# and some quick visualizations 
+ggplot(training_data, aes(x = datetime)) + geom_rect(data = training_data, aes(xmin = start_date, xmax = end_date, 
+                                                                       ymin = -Inf, ymax = Inf, 
+                                                                       fill = activity_name)) +  
+  #scale_fill_manual(values = color_palette) + 
+  geom_line(aes(y = x, color = "x")) +
+  geom_line(aes(y = y, color = "y")) +
+  geom_line(aes(y = z, color = "z")) +
+  scale_color_manual(values = c("x" = "red", "y" = "green", "z" = "blue")) +
+  scale_fill_manual(values = color_palette) + 
+  xlim(as.POSIXct("2022-12-07 11:40:00"), as.POSIXct("2022-12-07 12:05:00")) +
+  ggtitle("2022-12-07, Underarm sensor data for training") +
+  labs(x = "Datetime", y = "Value")
+
+
+ggplot(analysis(folds$splits[[1]]), aes(x = datetime)) + geom_rect(data = analysis(folds$splits[[1]]), aes(xmin = start_date, xmax = end_date, 
+                                                                       ymin = -Inf, ymax = Inf, 
+                                                                       fill = activity_name)) +  
+  #scale_fill_manual(values = color_palette) + 
+  geom_line(aes(y = x, color = "x")) +
+  geom_line(aes(y = y, color = "y")) +
+  geom_line(aes(y = z, color = "z")) +
+  scale_color_manual(values = c("x" = "red", "y" = "green", "z" = "blue")) +
+  scale_fill_manual(values = color_palette) + 
+  xlim(as.POSIXct("2022-12-07 11:40:00"), as.POSIXct("2022-12-07 12:00:00")) +
+  ggtitle("2022-12-07, Underarm sensor data for training using random fold#1") +
+  labs(x = "Datetime", y = "Value")
+
+ggplot(analysis(folds$splits[[2]]), aes(x = datetime)) + geom_rect(data = analysis(folds$splits[[2]]), aes(xmin = start_date, xmax = end_date, 
+                                                                       ymin = -Inf, ymax = Inf, 
+                                                                       fill = activity_name)) +  
+  #scale_fill_manual(values = color_palette) + 
+  geom_line(aes(y = x, color = "x")) +
+  geom_line(aes(y = y, color = "y")) +
+  geom_line(aes(y = z, color = "z")) +
+  scale_color_manual(values = c("x" = "red", "y" = "green", "z" = "blue")) +
+  scale_fill_manual(values = color_palette) + 
+  xlim(as.POSIXct("2022-12-07 11:40:00"), as.POSIXct("2022-12-07 12:00:00")) +
+  ggtitle("2022-12-07, Underarm sensor data for training using random fold#2") +
+  labs(x = "Datetime", y = "Value")
+
+
+ggplot(analysis(folds$splits[[3]]), aes(x = datetime)) + geom_rect(data = analysis(folds$splits[[3]]), aes(xmin = start_date, xmax = end_date, 
+                                                                       ymin = -Inf, ymax = Inf, 
+                                                                       fill = activity_name)) +  
+  #scale_fill_manual(values = color_palette) + 
+  geom_line(aes(y = x, color = "x")) +
+  geom_line(aes(y = y, color = "y")) +
+  geom_line(aes(y = z, color = "z")) +
+  scale_color_manual(values = c("x" = "red", "y" = "green", "z" = "blue")) +
+  scale_fill_manual(values = color_palette) + 
+  xlim(as.POSIXct("2022-12-07 11:40:00"), as.POSIXct("2022-12-07 12:00:00")) +
+  ggtitle("2022-12-07, Underarm sensor data for training using random fold#3") +
+  labs(x = "Datetime", y = "Value")
+
+
+ggplot(testing_data, aes(x = datetime)) + geom_rect(data = testing_data, aes(xmin = start_date, xmax = end_date, 
+                                                                          ymin = -Inf, ymax = Inf, 
+                                                                          fill = activity_name)) +  
+  geom_line(aes(y = x, color = "x")) +
+  geom_line(aes(y = y, color = "y")) +
+  geom_line(aes(y = z, color = "z")) +
+  scale_color_manual(values = c("x" = "red", "y" = "green", "z" = "blue")) +
+  scale_fill_manual(values = color_palette) + 
+  xlim(as.POSIXct("2022-12-07 12:00:00"), as.POSIXct("2022-12-07 12:10:00")) +
+  ggtitle("2022-12-07, Underarm sensor data for testing") +
+  labs(x = "Datetime", y = "Value")
+
+```
+
+```{r ml decision tree routines}
+
+
+tune_spec <- decision_tree(tree_depth = tune(),
+                           cost_complexity = tune()) %>%
+  # Specify mode
+  set_mode("classification") %>%
+  # Specify engine
+  set_engine("rpart")
+
+tree_grid <- grid_regular(parameters(tune_spec),
+                          levels = 20)
+
+print(tree_grid)
+# Tune along the grid
+tune_results <- tune_grid(tune_spec,
+                          activity_name ~ x+y+z,
+                          resamples = folds,
+                          grid = tree_grid,
+                          metrics = metric_set(roc_auc, accuracy,sens))
+
+
+
+
+# Plot the tuning results
+autoplot(tune_results)
+
+# Select the parameters that perform best
+final_params <- select_best(tune_results)
+
+# Finalize the specification
+best_spec <- finalize_model(tune_spec, final_params)
+
+# Build the final model
+final_model <- fit(best_spec,
+                   activity_name ~ x+y+z,
+                  training_data)
+
+final_model
+
+
+fit <- rpart(activity_name ~ x+y+z, data =training_data, method = 'class')
+rpart.plot(fit, extra = 104)
+
+# Generate predictions
+predictions <- predict(final_model,
+                       new_data = testing_data)
+
+pred_combined <- predictions %>%
+  mutate(true_class = testing_data$activity)
+
+conf_mat(data = pred_combined,
+         estimate = .pred_class,
+         truth = true_class)
+
+```
+Define Bagging Model Specification:
+A bagging model specification (spec_bagged) is defined using bag_tree(). This sets up the model for bagging, a type of ensemble learning method. The set_mode() function specifies that it's a classification task, and set_engine() function sets the underlying model engine, in this case, "rpart" (recursive partitioning trees). It's important to note that the bagging process will use 50 bootstrap samples.
+
+Fit the Model to Training Data:
+The bagging model (model_bagged) is trained on the training dataset (training_data) using the fit() function. The formula activity_name ~ x+y+z specifies the target variable (activity_name) and the predictor variables (x, y, z).
+
+Generate Predictions:
+Predictions are made on the testing dataset (testing_data) using the trained bagging model with the predict() function. The predictions are then combined with the testing dataset.
+
+Confusion Matrix:
+A confusion matrix is generated to evaluate the performance of the predictions. The conf_mat() function calculates the confusion matrix using the predicted classes (estimate) and the true classes (truth) from the testing dataset.
+
+Cross-Validation for Performance Estimation:
+The code performs cross-validation (fit_resamples()) using the bagging model specification (spec_bagged) on the training dataset with the specified metrics (roc_auc, accuracy, sensitivity, specificity). Cross-validation helps in estimating the model's performance on unseen data and assess its generalization ability.
+
+Collect Metrics:
+The collect_metrics() function gathers and presents the metrics calculated during cross-validation (cv_results). This provides insights into the model's performance across different folds of the data.
+
+```{r bagged trees}
+
+library(baguette)
+spec_bagged <- bag_tree() %>%
+  set_mode("classification") %>%
+  set_engine("rpart", times=30)
+
+# Fit to the training data
+model_bagged <- fit(spec_bagged,
+                    activity_name ~ x+y+z,
+                    data=training_data)
+
+# Print the model
+model_bagged
+
+predictions <- predict(model_bagged,
+                       new_data = testing_data) %>%
+  bind_cols(testing_data)
+
+#predictions <- predict(model_bagged,
+#                       new_data = testing_data)
+
+pred_combined <- predictions %>%
+  mutate(true_class = testing_data$activity_name)
+
+conf_mat(data = pred_combined,
+         estimate = .pred_class,
+         truth = true_class)
+
+# Estimate AUC using cross-validation
+cv_results <- fit_resamples(spec_bagged,
+                            activity_name ~ x+y+z,
+                            resamples = folds,
+                            metrics = metric_set(roc_auc,accuracy,sensitivity,specificity))
+
+# Collect metrics
+collect_metrics(cv_results)
+
+#library(pROC)
+#numeric_predictions <- as.numeric(predictions$.pred_class)
+#roc_curve_decision <- roc(testing_data$activity, numeric_predictions)
+#plot(roc_curve_decision, main = "decison tree ROC Curve")
+
+```
+Feature Importance Calculation:
+The script starts with calculating feature importance using a random forest model (rand_forest). The vip::vip() function is used to visualize the feature importances.
+
+Define Model Specification for Tuning:
+A random forest model specification (tune_spec) is defined with placeholders for hyperparameters (mtry, trees, min_n).
+
+Create Workflow for Tuning:
+A workflow (rf_workflow) is created to encapsulate the model specification and the formula (activity_name ~ x+y+z).
+
+Define Tuning Grid:
+grid_regular() function is used to create a grid of hyperparameters to search over.
+
+Hyperparameter Tuning:
+tune_grid() function is called to perform hyperparameter tuning using cross-validation (folds) and the defined grid.
+
+View Tuning Results:
+collect_metrics() function is used to gather and view the metrics calculated during hyperparameter tuning.
+
+Plot Tuning Results:
+autoplot() function is used to visualize the tuning results.
+
+Select Best Parameters:
+select_best() function is used to select the best-performing parameters based on a specific metric (in this case, "accuracy").
+
+Finalize Model Specification:
+finalize_model() function is used to incorporate the best parameters into the final model specification (best_spec).
+
+Build Final Model:
+The final model is built (final_model) using the finalized model specification and the training data (training_data).
+
+Generate Predictions:
+Predictions are generated on the testing data using the final model.
+
+Confusion Matrix:
+conf_mat() function is used to generate a confusion matrix to evaluate the performance of the final model.
+```{r random forest}
+# a simple importance feature running
+rand_forest(mode="classification") %>%
+  set_engine("ranger", importance = "impurity") %>%
+  fit(activity_name~ x+y+z, data =training_data) %>%
+  vip::vip()
+
+tune_spec <- rand_forest(
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+
+
+# Create a workflow for tuning
+rf_workflow <- workflow() %>%
+  add_model(tune_spec) %>%
+  add_formula(activity_name~ x+y+z)  # Adjust the formula based on your dataset
+
+grid <- grid_regular(
+  mtry(range = c(1, 3)),
+  trees(range = c(10, 2000)),
+  min_n(range = c(1, 15)),
+  levels = 20
+)
+
+# Perform the tuning
+rf_tune_results <- tune_grid(
+  object = rf_workflow,
+  resamples = folds,  
+  grid = grid
+)
+
+# View the tuning results
+collect_metrics(rf_tune_results)
+
+
+# Plot the tuning results
+autoplot(rf_tune_results)
+
+# Select the parameters that perform best
+final_params <- select_best(rf_tune_results, "accuracy")
+print(final_params)
+
+# Finalize the specification
+best_spec <- finalize_model(tune_spec, final_params)
+
+
+# Build the final model
+final_model <- fit(best_spec,
+                   activity_name ~  x+y+z,
+                   training_data)
+
+# Generate predictions
+predictions <- predict(final_model,
+                       new_data = testing_data)
+
+pred_combined <- predictions %>%
+  mutate(true_class = testing_data$activity)
+
+conf_mat(data = pred_combined,
+         estimate = .pred_class,
+         truth = true_class)
+
+
+#library(pROC)
+#numeric_predictions <- as.numeric(predictions$.pred_class)
+#roc_curve_random <- roc(testing_data$activity, numeric_predictions)
+#plot(roc_curve_random, main = "random forest ROC Curve")
+
+
+
+```
+Define Model Specification:
+The initial boost_spec specifies the model class as boosting trees for classification and sets the engine as XGBoost.
+
+Train the Model:
+The fit() function is used to train the model on the training dataset (training_data) using the 
+specified formula (activity_name ~ x+y+z).
+
+Cross-Validation:
+fit_resamples() function is used to perform cross-validation on the training dataset with the specified metric set (in this case, ROC AUC).
+
+Model Evaluation:
+collect_metrics() function gathers the metrics calculated during cross-validation.
+
+Predictions on Testing Data:
+The model is used to make predictions on the testing dataset (testing_data) using predict() function with type "prob" (probabilities) and then the predictions are combined with the testing dataset.
+
+Hyperparameter Tuning:
+Define the model specification again (boost_spec) with placeholders for hyperparameters.
+Create a tuning grid (tunegrid_boost) using grid_regular() function to specify the range of hyperparameters to search over.
+Use tune_grid() function to search for the best hyperparameters based on the specified metric (ROC AUC) using cross-validation.
+
+Plot Tuning Results:
+autoplot() is used to visualize the results of hyperparameter tuning.
+
+Select Best Hyperparameters:
+select_best() function is used to select the best hyperparameters from the tuning results.
+
+Finalize Model Specification:
+finalize_model() function is used to incorporate the best hyperparameters into the final model specification (final_spec).
+
+Train Final Model:
+Train the final model (final_model) on the full training dataset (training_data) using the finalized model specification.
+
+Make Predictions with Final Model:
+Use the final model to make predictions on the testing dataset and combine predictions with the testing dataset.
+```{r xgboost}
+
+# Specify the model class
+boost_spec <- boost_tree() %>%
+  # Set the mode
+  set_mode("classification") %>%
+  # Set the engine
+  set_engine("xgboost")
+
+boost_spec
+# Train the model on the training set
+boost_model <- fit(boost_spec,
+                   activity_name ~  x+y+z,
+                   data=training_data)
+
+boost_model
+
+
+# Fit and evaluate models for all folds
+cv_results <- fit_resamples(boost_spec,
+                            activity_name ~  x+y+z,
+                            resamples = folds,
+                            metrics=metric_set(roc_auc,accuracy,sensitivity,specificity))
+
+# Collect cross-validated metrics
+collect_metrics(cv_results)
+
+
+# Specify, fit, predict, and combine with training data
+predictions <- boost_tree() %>%
+  set_mode("classification") %>%
+  set_engine("xgboost") %>%
+  fit(activity_name ~  x+y+z, data = testing_data) %>%
+  predict(new_data = testing_data, type = "prob") %>%
+  bind_cols(testing_data)
+
+boost_spec <- boost_tree(
+  trees = 1000,
+  learn_rate=tune(),
+  tree_depth=tune(),
+  sample_size=tune()) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+# Create the tuning grid
+tunegrid_boost <- grid_regular(parameters(boost_spec),
+                               levels = 10)
+
+tunegrid_boost
+
+
+# Tune along the grid
+tune_results <- tune_grid(boost_spec,
+                          activity_name ~  x+y+z,
+                          resamples = folds,
+                          grid = tunegrid_boost,
+                          metrics = metric_set(roc_auc,accuracy,sensitivity,specificity))
+
+# Plot the results
+autoplot(tune_results)
+
+# Select the final hyperparameters
+best_params <- select_best(tune_results)
+
+# Finalize the specification
+final_spec <- finalize_model(boost_spec, best_params)
+
+# Train the final model on the full training data
+final_model <- final_spec %>% fit(formula=activity_name ~  x+y+z, data=training_data)
+
+predictions <- predict(final_model,testing_data, type="prob") %>%
+  bind_cols(testing_data)
+
+# Generate predictions
+predictions <- predict(final_model,
+                       new_data = testing_data)
+
+pred_combined <- predictions %>%
+  mutate(true_class = testing_data$activity)
+
+print(pred_combined)
+
+conf_mat(data = pred_combined,
+         estimate = .pred_class,
+         truth = true_class)
+
+
+pred_combined <- predictions %>%
+  mutate(true_class = testing_data$activity)
+
+#numeric_predictions <- as.numeric(pred_combined$.pred_class)
+#roc_curve_xgboost <- roc(testing_data$activity, numeric_predictions)
+#plot(roc_curve_xgboost, main = "xgboost ROC Curve")
+
+```
